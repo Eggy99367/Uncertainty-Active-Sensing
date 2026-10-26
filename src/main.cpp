@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESP32Ping.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -114,4 +115,9 @@ void loop() {
   CsiPacket packet;
   if (xQueueReceive(csiQueue, &packet, 0) == pdTRUE) emitCsi(packet);
   processRadar();
+  static uint32_t lastPing = 0;
+  if (WiFi.status() == WL_CONNECTED && millis() - lastPing >= PING_INTERVAL_MS) {
+    lastPing = millis();
+    Ping.ping(WiFi.gatewayIP(), 1);
+  }
 }
