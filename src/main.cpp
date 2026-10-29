@@ -120,4 +120,9 @@ void loop() {
     lastPing = millis();
     Ping.ping(WiFi.gatewayIP(), 1);
   }
+  static uint32_t lastStatus = 0;
+  if (millis() - lastStatus >= 5000) {
+    lastStatus = millis();
+    Serial.printf("STATUS,CSI_DROPPED,%lu\n", (unsigned long)csiDropped);
+  }
 }
