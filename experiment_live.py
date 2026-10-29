@@ -203,7 +203,25 @@ def main():
         stop.set()
         thread.join(timeout=2)
         ser.close()
-        print(f"\nSaved experiment data: {folder}", flush=True)
+        with lock:
+            csi_rows = list(all_csi)
+            radar_rows = list(all_radar)
+        summaries = []
+        for stage_key, stage_cn in STAGES:
+            ca = np.array([r[7] for r in csi_rows if r[2] == stage_key], dtype=float)
+            cv = np.array([r[8] for r in csi_rows if r[2] == stage_key], dtype=float)
+            ra = np.array([r[10] for r in radar_rows if r[2] == stage_key and r[4] == 1 and r[9] == 1], dtype=float)
+            summaries.append([stage_key, stage_cn, len(ca), float(np.mean(ca)) if len(ca) else math.nan,
+                              float(np.mean(cv)) if len(cv) else math.nan,
+                              len(ra), float(np.mean(ra)) if len(ra) else math.nan])
+        with summary_path.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["stage", "chinese", "csi_count", "mean_csi_amplitude",
+                        "mean_csi_variance", "radar_target1_detected_count", "mean_radar_distance_mm"])
+            w.writerows(summaries)
+        print(f"\nExperiment complete. CSV: {folder}", flush=True)
+        for r in summaries:
+            print(f"{r[0]}: CSI={r[2]}, radar target1 detections={r[5]}")
         play_sound("finish")
 
     def update(_):
@@ -262,7 +280,7 @@ def main():
 
     def on_close(_):
         if not finalized[0]:
-            print("Window closed early: saving partial data.", flush=True)
+            print("Window closed early: saving partial data and summary.", flush=True)
             finalize()
 
     fig.canvas.mpl_connect("close_event", on_close)
