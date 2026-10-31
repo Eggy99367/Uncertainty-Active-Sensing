@@ -219,7 +219,31 @@ def main():
             w.writerow(["stage", "chinese", "csi_count", "mean_csi_amplitude",
                         "mean_csi_variance", "radar_target1_detected_count", "mean_radar_distance_mm"])
             w.writerows(summaries)
-        print(f"\nExperiment complete. CSV: {folder}", flush=True)
+        fig2, axs = plt.subplots(3, 1, figsize=(12, 11))
+        colors = ["tab:green", "tab:blue", "tab:orange"]
+        for j, (stage_key, stage_cn) in enumerate(STAGES):
+            ca = [r for r in csi_rows if r[2] == stage_key]
+            ra = [r for r in radar_rows if r[2] == stage_key and r[4] == 1]
+            if ca:
+                x = np.array([r[1] for r in ca]) - (j * 40 + PREP_SECONDS)
+                axs[0].plot(x, [r[7] for r in ca], label=stage_key, color=colors[j], alpha=0.85)
+                axs[1].plot(x, [r[8] for r in ca], label=stage_key, color=colors[j], alpha=0.85)
+            if ra:
+                x = np.array([r[1] for r in ra]) - (j * 40 + PREP_SECONDS)
+                axs[2].plot(x, [r[10] for r in ra], label=stage_key, color=colors[j], alpha=0.85)
+        for ax, ylabel in zip(axs, ["Mean CSI amplitude", "CSI rolling variance", "Radar target 1 distance (mm)"]):
+            ax.set_ylabel(ylabel)
+            ax.set_xlim(0, RECORD_SECONDS)
+            ax.grid(alpha=0.3)
+            ax.legend(loc="upper right")
+        axs[-1].set_xlabel("Seconds since observation started")
+        fig2.suptitle("EMPTY vs SITTING vs LYING (30-second observations)")
+        fig2.tight_layout()
+        comparison = folder / "stage_comparison.png"
+        fig2.savefig(comparison, dpi=180)
+        plt.close(fig2)
+        print(f"\nExperiment complete. CSV and comparison: {folder}", flush=True)
+        print(f"Comparison graph: {comparison}", flush=True)
         for r in summaries:
             print(f"{r[0]}: CSI={r[2]}, radar target1 detections={r[5]}")
         play_sound("finish")
@@ -280,7 +304,7 @@ def main():
 
     def on_close(_):
         if not finalized[0]:
-            print("Window closed early: saving partial data and summary.", flush=True)
+            print("Window closed early: saving partial data and comparison.", flush=True)
             finalize()
 
     fig.canvas.mpl_connect("close_event", on_close)
