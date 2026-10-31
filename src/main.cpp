@@ -74,7 +74,13 @@ static void processRadar() {
     const uint8_t b = (uint8_t)radar.read();
     if (radarIndex == 0 && b != 0xAA) continue;
     radarFrame[radarIndex++] = b;
-    if (radarIndex == sizeof(radarFrame)) {
+    if (radarIndex == 2 && radarFrame[1] != 0xFF) {
+      radarIndex = (b == 0xAA) ? 1 : 0;
+    } else if (radarIndex == 3 && radarFrame[2] != 0x03) {
+      radarIndex = 0;
+    } else if (radarIndex == 4 && radarFrame[3] != 0x00) {
+      radarIndex = 0;
+    } else if (radarIndex == sizeof(radarFrame)) {
       if (radarFrame[28] == 0x55 && radarFrame[29] == 0xCC) emitRadarFrame();
       radarIndex = 0;
     }
