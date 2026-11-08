@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uncertainty-Active-Sensing</title>
+</head>
+<body>
+<h1>Uncertainty-Active-Sensing</h1>
+<p>Research log: Wi-Fi CSI and 24 GHz mmWave radar for bedside posture classification and future uncertainty-guided sensor activation.</p>
+<p><strong>Project status:</strong> Preliminary sensing and classification experiments completed; adaptive activation and energy evaluation planned.</p>
+
+<h2>1. Project Overview</h2>
+<p>This project studies whether a low-cost bedside sensing system can recognize three states (EMPTY, SITTING, LYING) while reducing energy consumption through selective radar activation. Wi-Fi CSI serves as the primary sensing modality; radar may be enabled when the CSI model is uncertain.</p>
+<p><strong>Research question:</strong> Can uncertainty-guided radar activation reduce sensing energy while maintaining reliable bedside posture classification?</p>
+<p><strong>Evaluation metrics:</strong> Macro-F1, radar activation rate, measured power consumption, and decision latency.</p>
+<p><strong>The central objective is not only to improve classification through sensor fusion, but also to determine when additional radar measurements are necessary.</strong></p>
+
+<h2>2. Hardware and System Architecture</h2>
+<ul>
+<li>ESP32: Wi-Fi CSI acquisition and UART radar reception.</li>
+<li>Dedicated Wi-Fi router: CSI signal source.</li>
+<li>HLK-LD2450 24 GHz mmWave radar: target position and motion measurements.</li>
+<li>Computer: USB serial logging, Python preprocessing, visualization, and model evaluation.</li>
+</ul>
+<p>Radar UART operates at 256000 baud; the ESP32 streams sensor records to the computer over USB serial at 921600 baud. The two sensing streams are logged concurrently.</p>
+<h3>Experimental Room Layout</h3>
+<figure><img src="assets/room_layout.png" alt="Sketch of room and sensor placement" width="650"><figcaption>Figure 1. Room layout sketch used for the initial experiment.</figcaption></figure>
+
+<h2>3. Data Collection</h2>
+<p>Three labeled states were recorded: EMPTY (no person on the bed), SITTING (person seated on the bed), and LYING (person lying on the bed).</p>
+<ul>
+<li>10 repeated rounds.</li>
+<li>30 seconds of recorded observation per state per round.</li>
+<li>15 seconds allowed for posture transitions.</li>
+<li>900 seconds of labeled observations in total.</li>
+<li>450 non-overlapping 2-second feature windows, 150 per class.</li>
+</ul>
+<p>All measurements were collected using a fixed sensor arrangement and the same experimental room. The experimenter performed each posture in repeated trials, while sensor measurements were recorded simultaneously. This controlled setup provides an initial feasibility evaluation but does not represent performance across different participants or environments.</p>
+<h3>State-Level Signal Comparison</h3>
+<figure><img src="assets/stage_comparison.png" alt="Sensor measurements compared across posture states" width="850"><figcaption>Figure 2. Sensor data comparison across recorded states.</figcaption></figure>
+
+<h2>4. Signal Processing and Feature Extraction</h2>
+<h3>4.1 Wi-Fi CSI</h3>
+<p>CSI measurements were collected through the ESP32 connected to a dedicated Wi-Fi router. Amplitude-related statistics and temporal variations were extracted from the received CSI measurements. These features were aggregated into non-overlapping 2-second windows for posture classification.</p>
+<p>Figure 3 shows the mean CSI amplitude recorded during one experimental round. Although the signal exhibits fluctuations across the three observation periods, the amplitude distributions overlap substantially. This suggests that simple amplitude statistics alone may not provide sufficient information to reliably distinguish all three posture states.</p>
+<figure><img src="assets/csi_round3.png" alt="CSI features from a recorded experimental round" width="850"><figcaption>Figure 3. Example CSI measurements from an experimental round.</figcaption></figure>
+<h3>4.2 Radar and Bed Region of Interest</h3>
+<p>The radar may report targets outside the bed even when the bed is empty. Since the bed is positioned close to a wall, radar signals may undergo reflections and multipath propagation, resulting in unexpected target detections. During the EMPTY state, the radar occasionally detected the experimenter standing behind the door, even though the experimenter was outside the radar's intended sensing area. Similarly, during the SITTING and LYING states, an additional target sometimes appeared outside the bed region, potentially due to reflected radar signals creating a ghost target.</p>
+<p>To reduce these unwanted detections, a bed region-of-interest (ROI) filter was applied in Python to suppress out-of-region tracks. The initial ROI used X from −1000 to 1000 mm and Y from 600 to 2100 mm, with temporal filtering for stable presence estimates. This approach focuses the analysis on targets located within the bed area rather than relying on all radar detections. However, the ROI is a geometry-based filter, not a general-purpose human detector.</p>
+<figure><img src="assets/radar_roi.png" alt="Radar tracking with bed ROI filtering" width="850"><figcaption>Figure 4. Radar target distributions across EMPTY, SITTING, and LYING states. Green points represent detections within the bed ROI, while orange points represent out-of-region detections. The dashed rectangle indicates the predefined bed ROI.</figcaption></figure>
+<h3>4.3 Window-Level Dataset</h3>
+<p>CSI and radar features were aligned into 450 labeled windows. Eight CSI features, eight radar features, and their 16-feature combination were used for model comparison. Missing radar values were handled within training folds to avoid information leakage.</p>
+<p>Each 2-second window was treated as one classification sample. Windows without valid radar targets were retained, and missing radar-derived feature values were imputed using statistics learned from the training folds only. This prevents information leakage during cross-validation.</p>
+
+<h2>5. Model Training and Validation</h2>
+<p>Random Forest classifiers were trained under three input configurations:</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<thead><tr><th>Model</th><th>Input</th><th>Classifier</th></tr></thead>
+<tbody><tr><td>CSI-only</td><td>8 CSI features</td><td>Random Forest</td></tr><tr><td>Radar-only</td><td>8 radar features</td><td>Random Forest</td></tr><tr><td>Fusion</td><td>16 combined features</td><td>Random Forest</td></tr></tbody>
+</table>
+<p><strong>Validation:</strong> 5-fold GroupKFold with experimental round as the grouping variable. Windows from the same round were not split across training and test partitions.</p>
+<p>GroupKFold was used instead of random window-level splitting to reduce data leakage caused by temporal correlation among windows collected within the same experimental round.</p>
+
+<h2>6. Preliminary Classification Results</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+<thead><tr><th>Model</th><th>Macro-F1</th><th>Accuracy</th></tr></thead>
+<tbody><tr><td>CSI-only</td><td>50.5%</td><td>52.0%</td></tr><tr><td>Radar-only</td><td>72.9%</td><td>74.0%</td></tr><tr><td>Fusion</td><td><strong>78.2%</strong></td><td><strong>78.4%</strong></td></tr></tbody>
+</table>
+<figure><img src="assets/model_comparison.png" alt="Macro-F1 comparison of CSI-only radar-only and fusion models" width="850"><figcaption>Figure 5. Preliminary 5-fold grouped cross-validation model comparison.</figcaption></figure>
+<h3>Confusion Matrices</h3>
+<figure><img src="assets/csi_only_confusion_matrix.png" alt="CSI-only confusion matrix" width="550"><figcaption>Figure 6. CSI-only confusion matrix.</figcaption></figure>
+<figure><img src="assets/radar_only_confusion_matrix.png" alt="Radar-only confusion matrix" width="550"><figcaption>Figure 7. Radar-only confusion matrix.</figcaption></figure>
+<figure><img src="assets/fusion_confusion_matrix.png" alt="Fusion confusion matrix" width="550"><figcaption>Figure 8. Fusion confusion matrix.</figcaption></figure>
+<p><strong>Interpretation:</strong> The fusion model achieved the highest Macro-F1 score of 78.2%, improving upon CSI-only by 27.7 percentage points and radar-only by 5.3 percentage points.
+
+Radar-only classification was highly effective for identifying EMPTY states, achieving 98.0% recall. However, it frequently misclassified LYING as SITTING. Sensor fusion improved LYING recall from 47.3% to 68.7%, suggesting that CSI and radar provide complementary information for posture recognition.
+
+Despite this improvement, SITTING and LYING remain difficult to distinguish consistently. Furthermore, the relatively low CSI-only Macro-F1 indicates that an uncertainty-guided activation strategy may require frequent radar assistance to maintain reliable classification performance.</p>
+<p><strong>Limitations:</strong> These are preliminary offline classification results from one fixed experimental setup. They do not establish performance across different rooms, subjects, sensor placements, or recording days.</p>
+
+<h2>7. Planned Uncertainty-Guided Active Sensing</h2>
+<p><strong>Proposed decision policy (not yet implemented):</strong> Obtain CSI-only class probabilities. If maximum predicted probability is above a selected threshold, use the CSI prediction; otherwise, request radar measurements and use the fusion classifier.</p>
+<ol><li>Calibrate or assess CSI prediction confidence using training data only.</li><li>Evaluate confidence thresholds on held-out rounds.</li><li>Plot radar activation rate versus Macro-F1.</li><li>Measure radar power, startup overhead, and inference latency before making energy-savings claims.</li></ol>
+<p><strong>Baseline:</strong> Always-on CSI + radar fusion. An offline activation simulation alone is not evidence of measured hardware energy savings.</p>
+
+<h2>8. Challenges and Future Work</h2>
+<ul>
+<li>CSI features overlap across posture classes.</li>
+<li>Radar produces occasional ghost or out-of-bed targets.</li>
+<li>SITTING and LYING are frequently confused.</li>
+<li>ROI thresholds are environment-dependent.</li>
+<li>Adaptive activation, real power gating, and measured energy savings remain to be validated.</li>
+</ul>
+<h3>Experiment Log</h3>
+<table border="1" cellpadding="6" cellspacing="0">
+<thead><tr><th>Stage</th><th>Activity</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>ESP32, router, and LD2450 integration</td><td>Completed</td></tr>
+<tr><td>2</td><td>Repeated three-state data collection</td><td>Completed</td></tr>
+<tr><td>3</td><td>ROI filtering and 2-second feature extraction</td><td>Completed</td></tr>
+<tr><td>4</td><td>Random Forest model training and evaluation</td><td>Completed</td></tr>
+<tr><td>5</td><td>Offline uncertainty-based activation evaluation</td><td>Planned</td></tr>
+<tr><td>6</td><td>Power, latency, and generalization experiments</td><td>Planned</td></tr>
+</tbody></table>
+</body>
+</html>
