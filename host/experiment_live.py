@@ -18,10 +18,16 @@ import serial
 from matplotlib.animation import FuncAnimation
 
 STAGES = [("EMPTY", "EMPTY"), ("SITTING", "SITTING"), ("LYING", "LYING")]
+ROUNDS = 5
 PREP_SECONDS = 10
 RECORD_SECONDS = 30
-TOTAL_SECONDS = len(STAGES) * (PREP_SECONDS + RECORD_SECONDS)
+BLOCK_SECONDS = PREP_SECONDS + RECORD_SECONDS
+TOTAL_SECONDS = ROUNDS * len(STAGES) * BLOCK_SECONDS
 MAX_DISPLAY = 500
+VOICE_ENABLED = True
+VOICE = "Samantha"
+VOICE_RATE = 200
+SPOKEN_NAMES = {"EMPTY": "empty", "SITTING": "sitting", "LYING": "lying"}
 
 
 def play_sound(kind):
@@ -38,18 +44,37 @@ def play_sound(kind):
     print("\a", end="", flush=True)
 
 
+_speech = [None]
+
+
+def speak(text, fallback, interrupt=True):
+    if VOICE_ENABLED and sys.platform == "darwin":
+        try:
+            if _speech[0] is not None and _speech[0].poll() is None:
+                if interrupt:
+                    _speech[0].terminate()
+                else:
+                    _speech[0].wait(timeout=10)
+            _speech[0] = subprocess.Popen(["say", "-v", VOICE, "-r", str(VOICE_RATE), text],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    play_sound(fallback)
+
+
 def stage_at(elapsed):
     if elapsed < 0:
-        return "WAITING", "WAITING", -1, 0.0
+        return "WAITING", "WAITING", -1, 0, 0.0
     if elapsed >= TOTAL_SECONDS:
-        return "DONE", "DONE", -1, 0.0
-    block = PREP_SECONDS + RECORD_SECONDS
-    idx = int(elapsed // block)
-    local = elapsed - idx * block
-    label, chinese = STAGES[idx]
+        return "DONE", "DONE", -1, 0, 0.0
+    idx = int(elapsed // BLOCK_SECONDS)
+    local = elapsed - idx * BLOCK_SECONDS
+    label, name = STAGES[idx % len(STAGES)]
+    rnd = idx // len(STAGES) + 1
     if local < PREP_SECONDS:
-        return "TRANSITION", chinese, idx, PREP_SECONDS - local
-    return label, chinese, idx, local - PREP_SECONDS
+        return "TRANSITION", name, idx, rnd, PREP_SECONDS - local
+    return label, name, idx, rnd, local - PREP_SECONDS
 
 
 def main():
@@ -87,10 +112,10 @@ def main():
             wr = csv.writer(fraw)
             wc = csv.writer(fcsi)
             wm = csv.writer(fradar)
-            wr.writerow(["host_iso", "elapsed_s", "stage", "raw_line"])
-            wc.writerow(["host_iso", "elapsed_s", "stage", "esp_ms", "rssi_dbm",
+            wr.writerow(["host_iso", "elapsed_s", "stage", "round", "raw_line"])
+            wc.writerow(["host_iso", "elapsed_s", "stage", "round", "esp_ms", "rssi_dbm",
                          "csi_len", "first_word_invalid", "mean_amplitude", "rolling_variance"])
-            wm.writerow(["host_iso", "elapsed_s", "stage", "esp_ms", "target_id",
+            wm.writerow(["host_iso", "elapsed_s", "stage", "round", "esp_ms", "target_id",
                          "x_mm", "y_mm", "speed_cm_s", "resolution_mm", "detected", "distance_mm"])
             while not stop.is_set():
                 try:
@@ -107,9 +132,9 @@ def main():
                     continue
                 now = time.monotonic()
                 elapsed = now - t0[0] if t0[0] is not None else -1.0
-                stage, _, _, _ = stage_at(elapsed)
+                stage, _, _, rnd, _ = stage_at(elapsed)
                 host = datetime.now().isoformat(timespec="milliseconds")
-                wr.writerow([host, round(elapsed, 4), stage, line])
+                wr.writerow([host, round(elapsed, 4), stage, rnd, line])
                 if line.startswith("STATUS,"):
                     messages.put(line[:160])
                     continue
@@ -130,7 +155,7 @@ def main():
                         amp = float(np.hypot(pairs[:, 0], pairs[:, 1]).mean())
                         amp_window.append(amp)
                         variance = float(np.var(amp_window))
-                        row = [host, round(elapsed, 4), stage, esp_ms, rssi,
+                        row = [host, round(elapsed, 4), stage, rnd, esp_ms, rssi,
                                n, invalid, amp, variance]
                         wc.writerow(row)
                         with lock:
@@ -146,7 +171,7 @@ def main():
                             raise ValueError(f"RADAR fields={len(fields)}")
                         esp_ms, target, x, y, speed, resolution, detected = map(int, fields[1:])
                         dist = math.hypot(x, y) if detected else math.nan
-                        row = [host, round(elapsed, 4), stage, esp_ms, target,
+                        row = [host, round(elapsed, 4), stage, rnd, esp_ms, target,
                                x, y, speed, resolution, detected, dist]
                         wm.writerow(row)
                         with lock:
@@ -207,37 +232,44 @@ def main():
             csi_rows = list(all_csi)
             radar_rows = list(all_radar)
         summaries = []
-        for stage_key, stage_cn in STAGES:
-            ca = np.array([r[7] for r in csi_rows if r[2] == stage_key], dtype=float)
-            cv = np.array([r[8] for r in csi_rows if r[2] == stage_key], dtype=float)
-            ra = np.array([r[10] for r in radar_rows if r[2] == stage_key and r[4] == 1 and r[9] == 1], dtype=float)
-            summaries.append([stage_key, stage_cn, len(ca), float(np.mean(ca)) if len(ca) else math.nan,
-                              float(np.mean(cv)) if len(cv) else math.nan,
-                              len(ra), float(np.mean(ra)) if len(ra) else math.nan])
+        for rnd in list(range(1, ROUNDS + 1)) + ["ALL"]:
+            for stage_key, stage_name in STAGES:
+                cs = [r for r in csi_rows if r[2] == stage_key and (rnd == "ALL" or r[3] == rnd)]
+                ca = np.array([r[8] for r in cs], dtype=float)
+                cv = np.array([r[9] for r in cs], dtype=float)
+                ra = np.array([r[11] for r in radar_rows if r[2] == stage_key and (rnd == "ALL" or r[3] == rnd)
+                               and r[5] == 1 and r[10] == 1], dtype=float)
+                summaries.append([rnd, stage_key, stage_name, len(ca), float(np.mean(ca)) if len(ca) else math.nan,
+                                  float(np.mean(cv)) if len(cv) else math.nan,
+                                  len(ra), float(np.mean(ra)) if len(ra) else math.nan])
         with summary_path.open("w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["stage", "chinese", "csi_count", "mean_csi_amplitude",
+            w.writerow(["round", "stage", "name", "csi_count", "mean_csi_amplitude",
                         "mean_csi_variance", "radar_target1_detected_count", "mean_radar_distance_mm"])
             w.writerows(summaries)
         fig2, axs = plt.subplots(3, 1, figsize=(12, 11))
         colors = ["tab:green", "tab:blue", "tab:orange"]
-        for j, (stage_key, stage_cn) in enumerate(STAGES):
-            ca = [r for r in csi_rows if r[2] == stage_key]
-            ra = [r for r in radar_rows if r[2] == stage_key and r[4] == 1]
-            if ca:
-                x = np.array([r[1] for r in ca]) - (j * 40 + PREP_SECONDS)
-                axs[0].plot(x, [r[7] for r in ca], label=stage_key, color=colors[j], alpha=0.85)
-                axs[1].plot(x, [r[8] for r in ca], label=stage_key, color=colors[j], alpha=0.85)
-            if ra:
-                x = np.array([r[1] for r in ra]) - (j * 40 + PREP_SECONDS)
-                axs[2].plot(x, [r[10] for r in ra], label=stage_key, color=colors[j], alpha=0.85)
+        for j, (stage_key, stage_name) in enumerate(STAGES):
+            for rnd in range(1, ROUNDS + 1):
+                offset = ((rnd - 1) * len(STAGES) + j) * BLOCK_SECONDS + PREP_SECONDS
+                label = stage_key if rnd == 1 else None
+                ca = [r for r in csi_rows if r[2] == stage_key and r[3] == rnd]
+                ra = [r for r in radar_rows if r[2] == stage_key and r[3] == rnd and r[5] == 1]
+                if ca:
+                    x = np.array([r[1] for r in ca]) - offset
+                    axs[0].plot(x, [r[8] for r in ca], label=label, color=colors[j], alpha=0.6)
+                    axs[1].plot(x, [r[9] for r in ca], label=label, color=colors[j], alpha=0.6)
+                if ra:
+                    x = np.array([r[1] for r in ra]) - offset
+                    axs[2].plot(x, [r[11] for r in ra], label=label, color=colors[j], alpha=0.6)
         for ax, ylabel in zip(axs, ["Mean CSI amplitude", "CSI rolling variance", "Radar target 1 distance (mm)"]):
             ax.set_ylabel(ylabel)
             ax.set_xlim(0, RECORD_SECONDS)
             ax.grid(alpha=0.3)
-            ax.legend(loc="upper right")
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend(loc="upper right")
         axs[-1].set_xlabel("Seconds since observation started")
-        fig2.suptitle("EMPTY vs SITTING vs LYING (30-second observations)")
+        fig2.suptitle(f"EMPTY vs SITTING vs LYING ({ROUNDS} rounds, {RECORD_SECONDS}-second observations)")
         fig2.tight_layout()
         comparison = folder / "stage_comparison.png"
         fig2.savefig(comparison, dpi=180)
@@ -245,29 +277,29 @@ def main():
         print(f"\nExperiment complete. CSV and comparison: {folder}", flush=True)
         print(f"Comparison graph: {comparison}", flush=True)
         for r in summaries:
-            print(f"{r[0]}: CSI={r[2]}, radar target1 detections={r[5]}")
-        play_sound("finish")
+            print(f"Round {r[0]} {r[1]}: CSI={r[3]}, radar target1 detections={r[6]}")
+        speak("Experiment complete. Data saved.", "finish", interrupt=False)
 
     def update(_):
         if t0[0] is None:
             t0[0] = time.monotonic()
-            print("Experiment started: 10s preparation for EMPTY", flush=True)
+            print(f"Experiment started: {ROUNDS} rounds, {PREP_SECONDS}s preparation for EMPTY", flush=True)
         elapsed = time.monotonic() - t0[0]
-        phase, name, idx, phase_time = stage_at(elapsed)
+        phase, name, idx, rnd, phase_time = stage_at(elapsed)
         phase_id = (phase, idx)
+        spoken = SPOKEN_NAMES.get(name, name)
         if phase_id != last_phase[0]:
             last_phase[0] = phase_id
             if phase == "TRANSITION":
-                if idx > 0:
-                    play_sound("end")
-                print(f"\nPrepare {name}: 10 seconds", flush=True)
-                play_sound("prepare")
+                print(f"\nRound {rnd}/{ROUNDS} | Prepare {name}: {PREP_SECONDS} seconds", flush=True)
+                intro = "Recording finished. " if idx > 0 else ""
+                speak(f"{intro}Round {rnd}. Prepare for {spoken}.", "prepare")
             elif phase in [s[0] for s in STAGES]:
-                print(f"\nRECORDING {name}: 30 seconds", flush=True)
-                play_sound("start")
+                print(f"\nRound {rnd}/{ROUNDS} | RECORDING {name}: {RECORD_SECONDS} seconds", flush=True)
+                speak(f"Start recording {spoken}.", "start")
             elif phase == "DONE":
                 print("\nFinal recording finished", flush=True)
-                play_sound("end")
+                speak("All recordings finished. Saving data.", "end")
                 finalize()
         if phase == "TRANSITION":
             remaining = int(math.ceil(phase_time))
@@ -294,7 +326,7 @@ def main():
                 ax.autoscale_view(scalex=False, scaley=True)
         for ax in axes:
             ax.set_xlim(max(0, elapsed - 45), max(45, elapsed + 1))
-        status.set_text(f"{phase}: {name} | {phase_time:.1f}s | CSI {count['CSI']} | "
+        status.set_text(f"Round {rnd}/{ROUNDS} | {phase}: {name} | {phase_time:.1f}s | CSI {count['CSI']} | "
                         f"RADAR {count['RADAR']} | BAD {count['BAD']} | {state['serial']}")
         while not messages.empty():
             print(messages.get_nowait(), flush=True)
