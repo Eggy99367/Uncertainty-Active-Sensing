@@ -18,12 +18,15 @@ import serial
 from matplotlib.animation import FuncAnimation
 
 STAGES = [("EMPTY", "EMPTY"), ("SITTING", "SITTING"), ("LYING", "LYING")]
-ROUNDS = 5
-PREP_SECONDS = 10
+ROUNDS = 10
+PREP_SECONDS = 15
 RECORD_SECONDS = 30
 BLOCK_SECONDS = PREP_SECONDS + RECORD_SECONDS
 TOTAL_SECONDS = ROUNDS * len(STAGES) * BLOCK_SECONDS
 MAX_DISPLAY = 500
+PRESENCE_ON_SECONDS = 0.8
+PRESENCE_OFF_SECONDS = 1.5
+BED_ROI = (-1000, 1000, 600, 2100)
 VOICE_ENABLED = True
 VOICE = "Samantha"
 VOICE_RATE = 200
@@ -77,6 +80,12 @@ def stage_at(elapsed):
     return label, name, idx, rnd, local - PREP_SECONDS
 
 
+def in_bed_roi(x, y):
+    """Return whether a radar target lies within the configured bed ROI."""
+    return BED_ROI is None or (BED_ROI[0] <= x <= BED_ROI[1] and
+                               BED_ROI[2] <= y <= BED_ROI[3])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default="/dev/cu.usbserial-0001")
@@ -90,6 +99,7 @@ def main():
     csi_path = folder / "csi_features.csv"
     radar_path = folder / "radar_targets.csv"
     summary_path = folder / "stage_summary.csv"
+    presence_path = folder / "radar_presence.csv"
 
     lock = threading.Lock()
     stop = threading.Event()
@@ -97,26 +107,65 @@ def main():
     data = {"t": deque(maxlen=MAX_DISPLAY), "amp": deque(maxlen=MAX_DISPLAY),
             "variance": deque(maxlen=MAX_DISPLAY), "rssi": deque(maxlen=MAX_DISPLAY),
             "radar_t": deque(maxlen=MAX_DISPLAY), "radar_dist": deque(maxlen=MAX_DISPLAY),
-            "radar_speed": deque(maxlen=MAX_DISPLAY)}
+            "radar_speed": deque(maxlen=MAX_DISPLAY),
+            "presence_t": deque(maxlen=MAX_DISPLAY),
+            "presence": deque(maxlen=MAX_DISPLAY)}
     amp_window = deque(maxlen=20)
     counts = {"CSI": 0, "RADAR": 0, "BAD": 0}
     all_csi = []
     all_radar = []
     messages = queue.Queue()
-    state = {"serial": "Connecting", "experiment": "WAITING"}
+    state = {"serial": "Connecting", "experiment": "WAITING", "presence": False}
+    # All three target slots share one ESP timestamp; evaluate them together.
+    tracker = {"candidate_since": None, "absent_since": None, "present": False,
+               "frame_ms": None, "frame_targets": [], "last_frame_host": None,
+               "last_frame_elapsed": None, "last_frame_stage": None,
+               "last_frame_round": None}
 
     def reader(ser):
         with raw_path.open("w", newline="", buffering=1) as fraw, \
              csi_path.open("w", newline="", buffering=1) as fcsi, \
-             radar_path.open("w", newline="", buffering=1) as fradar:
+             radar_path.open("w", newline="", buffering=1) as fradar, \
+             presence_path.open("w", newline="", buffering=1) as fpresence:
             wr = csv.writer(fraw)
             wc = csv.writer(fcsi)
             wm = csv.writer(fradar)
+            wp = csv.writer(fpresence)
             wr.writerow(["host_iso", "elapsed_s", "stage", "round", "raw_line"])
             wc.writerow(["host_iso", "elapsed_s", "stage", "round", "esp_ms", "rssi_dbm",
                          "csi_len", "first_word_invalid", "mean_amplitude", "rolling_variance"])
             wm.writerow(["host_iso", "elapsed_s", "stage", "round", "esp_ms", "target_id",
                          "x_mm", "y_mm", "speed_cm_s", "resolution_mm", "detected", "distance_mm"])
+            wp.writerow(["host_iso", "elapsed_s", "stage", "round", "esp_ms",
+                         "raw_targets_in_roi", "filtered_human_present"])
+
+            def finish_frame():
+                if tracker["frame_ms"] is None:
+                    return
+                hits = tracker["frame_targets"]
+                raw_count = len(hits)
+                now_s = tracker["last_frame_elapsed"]
+                if raw_count:
+                    tracker["absent_since"] = None
+                    if tracker["candidate_since"] is None:
+                        tracker["candidate_since"] = now_s
+                    if not tracker["present"] and now_s - tracker["candidate_since"] >= PRESENCE_ON_SECONDS:
+                        tracker["present"] = True
+                else:
+                    tracker["candidate_since"] = None
+                    if tracker["absent_since"] is None:
+                        tracker["absent_since"] = now_s
+                    if tracker["present"] and now_s - tracker["absent_since"] >= PRESENCE_OFF_SECONDS:
+                        tracker["present"] = False
+                state["presence"] = tracker["present"]
+                wp.writerow([tracker["last_frame_host"], round(now_s, 4),
+                             tracker["last_frame_stage"], tracker["last_frame_round"],
+                             tracker["frame_ms"], raw_count, int(tracker["present"])])
+                with lock:
+                    if now_s >= 0:
+                        data["presence_t"].append(now_s)
+                        data["presence"].append(int(tracker["present"]))
+                tracker["frame_targets"] = []
             while not stop.is_set():
                 try:
                     incoming = ser.readline()
@@ -170,18 +219,32 @@ def main():
                         if len(fields) != 8:
                             raise ValueError(f"RADAR fields={len(fields)}")
                         esp_ms, target, x, y, speed, resolution, detected = map(int, fields[1:])
+                        # Flush previous 3-slot radar frame when timestamp changes.
+                        if tracker["frame_ms"] is not None and esp_ms != tracker["frame_ms"]:
+                            finish_frame()
+                        tracker["frame_ms"] = esp_ms
+                        tracker["last_frame_host"] = host
+                        tracker["last_frame_elapsed"] = elapsed
+                        tracker["last_frame_stage"] = stage
+                        tracker["last_frame_round"] = rnd
+                        in_roi = in_bed_roi(x, y)
+                        if detected and in_roi:
+                            tracker["frame_targets"].append(target)
                         dist = math.hypot(x, y) if detected else math.nan
                         row = [host, round(elapsed, 4), stage, rnd, esp_ms, target,
                                x, y, speed, resolution, detected, dist]
                         wm.writerow(row)
+                        if target == 3:
+                            finish_frame()
+                            tracker["frame_ms"] = None
                         with lock:
                             counts["RADAR"] += 1
                             if elapsed >= 0:
                                 all_radar.append(row)
                                 if target == 1:
                                     data["radar_t"].append(elapsed)
-                                    data["radar_dist"].append(dist)
-                                    data["radar_speed"].append(speed if detected else math.nan)
+                                    data["radar_dist"].append(dist if in_roi else math.nan)
+                                    data["radar_speed"].append(speed if detected and in_roi else math.nan)
                 except (ValueError, IndexError, csv.Error) as exc:
                     with lock:
                         counts["BAD"] += 1
@@ -203,11 +266,13 @@ def main():
     thread = threading.Thread(target=reader, args=(ser,), daemon=True)
     thread.start()
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
     fig.suptitle("ESP32 CSI + LD2450 | Live posture experiment")
     series = []
     labels = [("CSI mean amplitude", "Amplitude"), ("CSI rolling variance", "Variance"),
-              ("Radar target 1 distance", "Distance (mm)"), ("Radar target 1 speed", "Speed (cm/s)")]
+              ("Radar target 1 distance (Bed ROI filtered)", "Distance (mm)"),
+              ("Radar target 1 speed (Bed ROI filtered)", "Speed (cm/s)"),
+              ("Filtered human presence (heuristic)", "Present 0/1")]
     for ax, (title, ylabel) in zip(axes, labels):
         line, = ax.plot([], [], linewidth=1.4)
         series.append(line)
@@ -215,6 +280,8 @@ def main():
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.3)
     axes[-1].set_xlabel("Experiment elapsed time (s)")
+    axes[-1].set_ylim(-0.1, 1.1)
+    axes[-1].set_yticks([0, 1])
     status = fig.text(0.02, 0.01, "Starting...", fontsize=10)
     plt.tight_layout(rect=[0, 0.04, 1, 0.96])
     last_phase = [None]
@@ -238,14 +305,14 @@ def main():
                 ca = np.array([r[8] for r in cs], dtype=float)
                 cv = np.array([r[9] for r in cs], dtype=float)
                 ra = np.array([r[11] for r in radar_rows if r[2] == stage_key and (rnd == "ALL" or r[3] == rnd)
-                               and r[5] == 1 and r[10] == 1], dtype=float)
+                               and r[5] == 1 and r[10] == 1 and in_bed_roi(r[6], r[7])], dtype=float)
                 summaries.append([rnd, stage_key, stage_name, len(ca), float(np.mean(ca)) if len(ca) else math.nan,
                                   float(np.mean(cv)) if len(cv) else math.nan,
                                   len(ra), float(np.mean(ra)) if len(ra) else math.nan])
         with summary_path.open("w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["round", "stage", "name", "csi_count", "mean_csi_amplitude",
-                        "mean_csi_variance", "radar_target1_detected_count", "mean_radar_distance_mm"])
+                        "mean_csi_variance", "radar_target1_in_roi_count", "mean_radar_distance_in_roi_mm"])
             w.writerows(summaries)
         fig2, axs = plt.subplots(3, 1, figsize=(12, 11))
         colors = ["tab:green", "tab:blue", "tab:orange"]
@@ -261,7 +328,8 @@ def main():
                     axs[1].plot(x, [r[9] for r in ca], label=label, color=colors[j], alpha=0.6)
                 if ra:
                     x = np.array([r[1] for r in ra]) - offset
-                    axs[2].plot(x, [r[11] for r in ra], label=label, color=colors[j], alpha=0.6)
+                    axs[2].plot(x, [r[11] if r[10] == 1 and in_bed_roi(r[6], r[7]) else math.nan for r in ra],
+                                label=label, color=colors[j], alpha=0.6)
         for ax, ylabel in zip(axs, ["Mean CSI amplitude", "CSI rolling variance", "Radar target 1 distance (mm)"]):
             ax.set_ylabel(ylabel)
             ax.set_xlim(0, RECORD_SECONDS)
@@ -269,7 +337,7 @@ def main():
             if ax.get_legend_handles_labels()[0]:
                 ax.legend(loc="upper right")
         axs[-1].set_xlabel("Seconds since observation started")
-        fig2.suptitle(f"EMPTY vs SITTING vs LYING ({ROUNDS} rounds, {RECORD_SECONDS}-second observations)")
+        fig2.suptitle(f"EMPTY vs SITTING vs LYING ({ROUNDS} rounds, {RECORD_SECONDS}-second observations)\nRadar distance: target 1 inside Bed ROI only")
         fig2.tight_layout()
         comparison = folder / "stage_comparison.png"
         fig2.savefig(comparison, dpi=180)
@@ -277,7 +345,7 @@ def main():
         print(f"\nExperiment complete. CSV and comparison: {folder}", flush=True)
         print(f"Comparison graph: {comparison}", flush=True)
         for r in summaries:
-            print(f"Round {r[0]} {r[1]}: CSI={r[3]}, radar target1 detections={r[6]}")
+            print(f"Round {r[0]} {r[1]}: CSI={r[3]}, radar target1 ROI detections={r[6]}")
         speak("Experiment complete. Data saved.", "finish", interrupt=False)
 
     def update(_):
@@ -318,16 +386,21 @@ def main():
             rd = list(data["radar_dist"])
             rs = list(data["radar_speed"])
             count = dict(counts)
+        with lock:
+            pt = list(data["presence_t"])
+            pv = list(data["presence"])
         for line, xs, ys, ax in zip(series,
-                                   [t, t, rt, rt], [amp, var, rd, rs], axes):
+                                   [t, t, rt, rt, pt], [amp, var, rd, rs, pv], axes):
             line.set_data(xs, ys)
             if xs:
                 ax.relim()
-                ax.autoscale_view(scalex=False, scaley=True)
+                if ax is not axes[-1]:
+                    ax.autoscale_view(scalex=False, scaley=True)
         for ax in axes:
             ax.set_xlim(max(0, elapsed - 45), max(45, elapsed + 1))
         status.set_text(f"Round {rnd}/{ROUNDS} | {phase}: {name} | {phase_time:.1f}s | CSI {count['CSI']} | "
-                        f"RADAR {count['RADAR']} | BAD {count['BAD']} | {state['serial']}")
+                        f"RADAR {count['RADAR']} | HUMAN {'YES' if state['presence'] else 'NO'} "
+                        f"(heuristic) | BAD {count['BAD']} | {state['serial']}")
         while not messages.empty():
             print(messages.get_nowait(), flush=True)
         return (*series, status)
